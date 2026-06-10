@@ -433,7 +433,12 @@ impl Devenv {
                 // Phase 1: bring up Nix, open the store, build settings,
                 // validate the lock against a transient eval state, then
                 // drop it before phase 2 builds the long-lived one.
-                let gc_registration = crate::backend::init_nix(&nix_settings, &store_settings)?;
+                let nix_init = crate::backend::init_nix(&nix_settings, &store_settings)?;
+                // When a cachix token resolved, netrc-file already points at
+                // the not-yet-written cachix netrc; seed it before anything
+                // fetches.
+                cachix_manager.set_user_netrc_path(nix_init.user_netrc_file);
+                cachix_manager.seed_netrc_file().await?;
                 let store = crate::backend::open_store(&store_settings)?;
                 let (flake_settings, fetchers_settings) = crate::backend::build_settings()?;
 
@@ -478,7 +483,7 @@ impl Devenv {
                     store,
                     flake_settings,
                     fetchers_settings,
-                    gc_registration,
+                    nix_init.gc_registration,
                     bootstrap_args.clone(),
                     port_allocator.clone(),
                     Some(eval_cache_pool.clone()),

@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::OnceCell;
 use tracing::{debug, warn};
@@ -42,6 +43,13 @@ pub struct CachixManager {
     /// can read and Dhall-evaluate the cachix config from disk, and runs
     /// from several call sites per invocation; cache it once.
     resolved_token: OnceLock<Option<String>>,
+    /// The netrc in effect before devenv pointed `netrc-file` at its own
+    /// file; appended to every netrc devenv writes so credentials for
+    /// other hosts survive the override.
+    user_netrc_path: OnceLock<Option<PathBuf>>,
+    /// Tracks whether `paths.netrc` was written this run, so `Drop`
+    /// removes it.
+    netrc_written: AtomicBool,
 }
 
 impl CachixManager {
@@ -56,7 +64,21 @@ impl CachixManager {
             netrc_path: Arc::new(OnceCell::new()),
             auth_token_override,
             resolved_token: OnceLock::new(),
+            user_netrc_path: OnceLock::new(),
+            netrc_written: AtomicBool::new(false),
         }
+    }
+
+    /// Must be called before any netrc is written; later calls are ignored.
+    pub fn set_user_netrc_path(&self, path: Option<PathBuf>) {
+        let _ = self.user_netrc_path.set(path);
+    }
+
+    fn user_netrc_path(&self) -> Option<&Path> {
+        self.user_netrc_path
+            .get()?
+            .as_deref()
+            .filter(|p| *p != self.paths.netrc)
     }
 
     /// Resolve the Cachix auth token used for authenticating pulls
@@ -162,7 +184,9 @@ impl CachixManager {
         Ok(settings)
     }
 
-    /// Create a netrc file with Cachix authentication
+    /// The user's netrc is appended because `netrc-file` points at our
+    /// file for the whole run; netrc matching is per-host, so entries
+    /// don't conflict.
     async fn create_netrc_file(
         &self,
         netrc_path: &Path,
@@ -175,6 +199,21 @@ impl CachixManager {
             netrc_content.push_str(&format!(
                 "machine {cache}.cachix.org\nlogin token\npassword {auth_token}\n\n",
             ));
+        }
+
+        if let Some(user_netrc) = self.user_netrc_path() {
+            match tokio::fs::read_to_string(user_netrc).await {
+                Ok(content) => {
+                    netrc_content.push_str(&content);
+                    if !content.ends_with('\n') {
+                        netrc_content.push('\n');
+                    }
+                }
+                Err(e) => warn!(
+                    path = %user_netrc.display(),
+                    "failed to read user netrc, continuing without it: {e}"
+                ),
+            }
         }
 
         // Create netrc file with restrictive permissions (600)
@@ -207,7 +246,19 @@ impl CachixManager {
             })?;
         }
 
+        self.netrc_written.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// `netrc-file` points at our netrc from Nix init onward, but cachix
+    /// entries can only be written after config evaluation — which may
+    /// itself fetch from hosts needing the user's credentials. Seed the
+    /// file with those before anything fetches.
+    pub async fn seed_netrc_file(&self) -> Result<()> {
+        if self.resolve_auth_token().is_none() || self.netrc_path.get().is_some() {
+            return Ok(());
+        }
+        self.create_netrc_file(&self.paths.netrc, &[], "").await
     }
 
     /// Produce the resolved `StoreSettings` derived from this manager's
@@ -241,10 +292,11 @@ impl CachixManager {
         // before the file is written. This lets `netrc-file` be applied to
         // the Nix settings registry *before the store opens* and performs
         // any authenticated fetch (e.g. a private cache's `nix-cache-info`
-        // probe). The file content is created later by `ensure_netrc_file`,
-        // before the first substituter request. Without this, the netrc
-        // path is only known after cachix config is evaluated — too late,
-        // and private-cache requests go out unauthenticated (HTTP 401).
+        // probe). Without this, the netrc path is only known after cachix
+        // config is evaluated — too late, and private-cache requests go
+        // out unauthenticated (HTTP 401). `seed_netrc_file` writes the
+        // initial content right after Nix init; `ensure_netrc_file` adds
+        // the cachix entries once the caches are known.
         if let Some(path) = self.netrc_path.get() {
             settings.netrc_path = Some(PathBuf::from(path));
         } else if self.resolve_auth_token().is_some() {
@@ -256,12 +308,16 @@ impl CachixManager {
 
     /// Clean up the netrc file if it was created during this session
     fn cleanup_netrc(&self) {
-        if let Some(netrc_path_str) = self.netrc_path.get() {
-            let netrc_path = Path::new(netrc_path_str);
+        if self.netrc_written.load(Ordering::Relaxed) {
+            let netrc_path = &self.paths.netrc;
             match std::fs::remove_file(netrc_path) {
-                Ok(()) => debug!("Removed netrc file: {}", netrc_path_str),
+                Ok(()) => debug!("Removed netrc file: {}", netrc_path.display()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => warn!("Failed to remove netrc file {}: {}", netrc_path_str, e),
+                Err(e) => warn!(
+                    "Failed to remove netrc file {}: {}",
+                    netrc_path.display(),
+                    e
+                ),
             }
         }
     }
@@ -479,5 +535,104 @@ mod tests {
     fn returns_none_on_invalid_dhall() {
         let config = r#"{ authToken = "unterminated"#;
         assert_eq!(parse_dhall_auth_token(config), None);
+    }
+
+    fn test_manager(dir: &Path) -> CachixManager {
+        CachixManager::new(
+            CachixPaths {
+                trusted_keys: dir.join("trusted-keys.json"),
+                netrc: dir.join("netrc"),
+                daemon_socket: None,
+            },
+            Some("test-token".to_string()),
+        )
+    }
+
+    fn write_user_netrc(dir: &Path) -> PathBuf {
+        let path = dir.join("user-netrc");
+        std::fs::write(
+            &path,
+            "machine artifactory.example.com\nlogin damien\npassword hunter2\n",
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn netrc_includes_user_entries_after_cachix_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path());
+        manager.set_user_netrc_path(Some(write_user_netrc(dir.path())));
+
+        manager
+            .create_netrc_file(&manager.paths.netrc, &["mycache".to_string()], "tok")
+            .await
+            .unwrap();
+
+        let content = std::fs::read_to_string(&manager.paths.netrc).unwrap();
+        let cachix_pos = content.find("machine mycache.cachix.org").unwrap();
+        let user_pos = content.find("machine artifactory.example.com").unwrap();
+        assert!(content.contains("password tok"));
+        assert!(content.contains("password hunter2"));
+        assert!(cachix_pos < user_pos);
+    }
+
+    #[tokio::test]
+    async fn missing_user_netrc_degrades_to_cachix_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path());
+        manager.set_user_netrc_path(Some(dir.path().join("missing")));
+
+        manager
+            .create_netrc_file(&manager.paths.netrc, &["mycache".to_string()], "tok")
+            .await
+            .unwrap();
+
+        let content = std::fs::read_to_string(&manager.paths.netrc).unwrap();
+        assert!(content.contains("machine mycache.cachix.org"));
+        assert!(!content.contains("artifactory"));
+    }
+
+    #[tokio::test]
+    async fn seed_writes_user_entries_and_ensure_adds_cachix_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path());
+        manager.set_user_netrc_path(Some(write_user_netrc(dir.path())));
+
+        manager.seed_netrc_file().await.unwrap();
+        let seeded = std::fs::read_to_string(&manager.paths.netrc).unwrap();
+        assert!(seeded.contains("machine artifactory.example.com"));
+        assert!(!seeded.contains("cachix.org"));
+
+        manager
+            .ensure_netrc_file(&["mycache".to_string()])
+            .await
+            .unwrap();
+        let full = std::fs::read_to_string(&manager.paths.netrc).unwrap();
+        assert!(full.contains("machine mycache.cachix.org"));
+        assert!(full.contains("machine artifactory.example.com"));
+    }
+
+    #[tokio::test]
+    async fn seed_without_user_netrc_writes_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path());
+        manager.set_user_netrc_path(None);
+
+        manager.seed_netrc_file().await.unwrap();
+        assert_eq!(std::fs::read_to_string(&manager.paths.netrc).unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn seeded_netrc_is_removed_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = test_manager(dir.path());
+        manager.set_user_netrc_path(Some(write_user_netrc(dir.path())));
+
+        manager.seed_netrc_file().await.unwrap();
+        let netrc = manager.paths.netrc.clone();
+        assert!(netrc.exists());
+        drop(manager);
+        assert!(!netrc.exists());
     }
 }

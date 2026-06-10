@@ -11,7 +11,7 @@
 //! rather than hidden behind an aggregator helper. The pattern is:
 //!
 //! ```ignore
-//! let _gc = init_nix(&nix_settings, &store_settings)?;
+//! let init = init_nix(&nix_settings, &store_settings)?;
 //! let store = open_store(&store_settings)?;
 //! let (flake_settings, fetchers_settings) = build_settings()?;
 //! let logger_setup = logger::setup_nix_logger()?;
@@ -23,14 +23,14 @@
 //! let bootstrap_args = build_bootstrap_args(..., &fingerprint)?;
 //! let backend = NixCBackend::new(
 //!     paths, nix_settings, cache_settings, nixpkgs_config,
-//!     store, flake_settings, fetchers_settings, _gc,
+//!     store, flake_settings, fetchers_settings, init.gc_registration,
 //!     bootstrap_args, port_allocator, eval_cache_pool, logger_setup,
 //! )?;
 //! ```
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use cstr::cstr;
@@ -73,17 +73,20 @@ use crate::cnix_store::CNixStore;
 use crate::error::{dedent_lines, select_raw_error};
 use crate::umask_guard::UmaskGuard;
 
+/// Result of [`init_nix`].
+pub struct NixInit {
+    /// Must outlive the thread's Nix/GC state — typically handed to
+    /// [`NixCBackend::new`], which adopts ownership.
+    pub gc_registration: ThreadRegistrationGuard,
+    /// The effective `netrc-file` captured before devenv's override, so
+    /// the user's credentials can be merged into the generated netrc.
+    pub user_netrc_file: Option<PathBuf>,
+}
+
 /// Initialize Nix FFI globals, register the calling thread with the GC,
 /// and apply process-global Nix settings (experimental features, options
 /// from `nix_settings`, and `netrc-file` from `store_settings`).
-///
-/// The returned guard must be kept alive for as long as the calling
-/// thread holds Nix/GC state — typically, hand it to
-/// [`NixCBackend::new`], which adopts ownership.
-pub fn init_nix(
-    nix_settings: &NixSettings,
-    store_settings: &StoreSettings,
-) -> Result<ThreadRegistrationGuard> {
+pub fn init_nix(nix_settings: &NixSettings, store_settings: &StoreSettings) -> Result<NixInit> {
     crate::nix_init();
     let gc_registration = gc_register_my_thread()
         .to_miette()
@@ -92,6 +95,7 @@ pub fn init_nix(
         .to_miette()
         .wrap_err("Failed to enable experimental features")?;
     apply_nix_settings(nix_settings)?;
+    let user_netrc_file = original_netrc_file();
     if let Some(netrc) = &store_settings.netrc_path
         && let Some(s) = netrc.to_str()
     {
@@ -99,7 +103,25 @@ pub fn init_nix(
             .to_miette()
             .wrap_err("Failed to set netrc-file")?;
     }
-    Ok(gc_registration)
+    Ok(NixInit {
+        gc_registration,
+        user_netrc_file,
+    })
+}
+
+/// `netrc-file` is process-global and overridden by `init_nix`, so the
+/// pre-override value is captured once per process — a later `Devenv` in
+/// the same process (mcp, devenv-run-tests) would otherwise read back the
+/// override. Only an existing file counts: the default
+/// `$NIX_CONF_DIR/netrc` usually doesn't exist.
+fn original_netrc_file() -> Option<PathBuf> {
+    static ORIGINAL: OnceLock<Option<PathBuf>> = OnceLock::new();
+    ORIGINAL
+        .get_or_init(|| {
+            let path = PathBuf::from(settings::get("netrc-file").ok()?);
+            path.is_file().then_some(path)
+        })
+        .clone()
 }
 
 /// Open the Nix store and apply substituters / trusted public keys from

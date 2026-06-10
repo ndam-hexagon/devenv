@@ -306,7 +306,7 @@ pub fn init_backend(
     let nixpkgs_config = config.nixpkgs_config(&nix_settings.system);
     let store_settings = StoreSettings::default();
 
-    let gc_registration = devenv_nix_backend::backend::init_nix(&nix_settings, &store_settings)?;
+    let nix_init = devenv_nix_backend::backend::init_nix(&nix_settings, &store_settings)?;
     let store = devenv_nix_backend::backend::open_store(&store_settings)?;
     let (flake_settings, fetchers_settings) = devenv_nix_backend::backend::build_settings()?;
     let logger_setup = devenv_nix_backend::logger::setup_nix_logger()?;
@@ -320,7 +320,7 @@ pub fn init_backend(
         store,
         flake_settings,
         fetchers_settings,
-        gc_registration,
+        nix_init.gc_registration,
         Arc::new(bootstrap_args),
         Arc::new(PortAllocator::new()),
         None,

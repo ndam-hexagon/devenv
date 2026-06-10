@@ -199,6 +199,12 @@ impl CachixManager {
                 .wrap_err_with(|| {
                     format!("Failed to write netrc content to {}", netrc_path.display())
                 })?;
+
+            // tokio file writes complete on a background task; without a
+            // flush the file can still be empty when the next fetch reads it.
+            file.flush().await.into_diagnostic().wrap_err_with(|| {
+                format!("Failed to flush netrc content to {}", netrc_path.display())
+            })?;
         }
 
         Ok(())
